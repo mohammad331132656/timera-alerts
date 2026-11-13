@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Notify a Telegram channel ONCE per newly opened Timera booking day.
 
+2026-11: six-second gap between messages and automatic 429 retry_after handling.
+
 Source evidence: public browser JavaScript saved by the user (Timera v4.3.1).
 A live response from Timera has not been observed in this environment.
 Only reads public booking data. Does not log in, reserve, or pay.
@@ -182,22 +184,72 @@ def message_for_day(key: str) -> str:
 
 
 def telegram_send(message: str) -> None:
+    """Send one confirmed message, respecting Telegram's 429 retry_after.
+
+    On a timeout/connection failure do not auto-retry: delivery may have
+    succeeded even though its response was lost (avoid immediate duplicates).
+    """
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
     if not token or not chat_id:
         raise RuntimeError("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in GitHub Actions Secrets")
-    response = requests.post(
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        json={"chat_id": chat_id, "text": message, "disable_web_page_preview": True},
-        timeout=20,
-    )
-    response.raise_for_status()
-    try:
-        obj = response.json()
-    except ValueError as exc:
-        raise RuntimeError("Telegram returned a non-JSON response") from exc
-    if not isinstance(obj, dict) or not obj.get("ok"):
-        raise RuntimeError("Telegram did not confirm message delivery")
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    data = {"chat_id": chat_id, "text": message, "disable_web_page_preview": True}
+    max_attempts = 6
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = requests.post(url, json=data, timeout=25)
+        except requests.RequestException as exc:
+            # Never print the exception or Telegram URL: both can reveal the bot token.
+            raise RuntimeError(
+                f"Telegram connection problem ({type(exc).__name__}); delivery not confirmed. "
+                "This date remains pending for the next run."
+            ) from None
+
+        try:
+            result = response.json()
+        except ValueError:
+            raise RuntimeError(
+                f"Telegram HTTP {response.status_code} returned an invalid JSON response"
+            ) from None
+
+        if not isinstance(result, dict):
+            raise RuntimeError("Unexpected Telegram response format")
+
+        if response.status_code == 429 or result.get("error_code") == 429:
+            parameters = result.get("parameters")
+            retry_after = parameters.get("retry_after") if isinstance(parameters, dict) else None
+            try:
+                wait_seconds = int(retry_after)
+                if wait_seconds < 1:
+                    raise ValueError("retry_after must be positive")
+            except (TypeError, ValueError, OverflowError):
+                # Only used if Telegram omits its documented retry_after value.
+                wait_seconds = min(30 * attempt, 180)
+
+            if attempt == max_attempts or wait_seconds > 1200:
+                raise RuntimeError(
+                    f"Telegram rate limit (429): retry after {wait_seconds}s. "
+                    "Stopping safely; unsent dates will be retried next scheduled run."
+                )
+
+            print(f"Telegram flood control (429): waiting {wait_seconds + 1}s "
+                  f"before attempt {attempt + 1}/{max_attempts}", flush=True)
+            time.sleep(wait_seconds + 1)
+            continue
+
+        try:
+            response.raise_for_status()
+        except requests.HTTPError:
+            # Avoid logging the request URL containing the secret token.
+            raise RuntimeError(f"Telegram rejected the message (HTTP {response.status_code})") from None
+
+        if not result.get("ok"):
+            raise RuntimeError(f"Telegram did not accept the message (code {result.get('error_code', 'unknown')})")
+        return  # Only confirmed sends are recorded in .timera_state.json.
+
+    raise RuntimeError("Telegram retries exhausted")
 
 
 def load_state(path: Path | None = None) -> set[str]:
@@ -250,7 +302,7 @@ def run(dry_run: bool = False) -> list[str]:
         return new
     if new:
         # Save on EVERY successful Telegram delivery (a later send might fail).
-        sent = process_days(open_days, announced, telegram_send, save_state, pause=1.1)
+        sent = process_days(open_days, announced, telegram_send, save_state, pause=6.0)
         print(f"Sent {len(sent)} separate Telegram channel messages")
     else:
         # First run still creates a baseline file. All historically sent dates are retained.
